@@ -1,8 +1,4 @@
 use base64::Engine;
-use rusqlite::{
-    backup::{Backup, StepResult},
-    params, Connection, OpenFlags,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use ring::digest::{Context, SHA256};
@@ -15,11 +11,14 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::UNIX_EPOCH,
 };
 use tauri::{Emitter, Manager};
 
-const MAX_PREVIEW_BYTES: u64 = 20 * 1024 * 1024;
+// This caps the downloaded original, before resizing. Image decoding also keeps
+// image crate's default allocation limit in place for highly compressed files.
+const MAX_PREVIEW_BYTES: u64 = 100 * 1024 * 1024;
+const PREVIEW_CACHE_VERSION: u8 = 1;
 const CIVITAI_API: &str = "https://civitai.com/api/v1/model-versions/by-hash/";
 const CANCELLED_REASON: &str = "__invoke_tool_suite_cancelled__";
 const KEYRING_SERVICE: &str = "invoke-tool-suite";
@@ -134,12 +133,11 @@ pub(super) struct Report {
     no_preview_image: usize,
     trigger_phrases_added: usize,
     thumbnails_added: usize,
+    thumbnails_updated: usize,
     already_had_triggers: usize,
     already_had_thumbnails: usize,
     skipped: usize,
     errors: usize,
-    backup_path: String,
-    backup_created: bool,
     issues: Vec<Issue>,
 }
 
@@ -150,6 +148,7 @@ pub(super) struct CacheInfo {
     entries: usize,
     matched: usize,
     not_found: usize,
+    thumbnail_settings: usize,
     read_error: Option<String>,
 }
 
@@ -160,6 +159,14 @@ struct CachedMatch {
     #[serde(default)]
     trigger_phrases: Vec<String>,
     preview_url: Option<String>,
+    #[serde(default)]
+    preview_checked: bool,
+    #[serde(default)]
+    preview_version: u8,
+    #[serde(default)]
+    thumbnail_size: Option<u32>,
+    #[serde(default)]
+    thumbnail_quality: Option<u8>,
 }
 
 #[derive(Clone)]
@@ -169,40 +176,7 @@ struct Model {
     kind: String,
     path: PathBuf,
     needs_triggers: bool,
-    needs_thumbnail: bool,
-}
-
-fn backup_database(db: &Connection, path: &Path, retention: usize) -> Result<PathBuf, String> {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let backup_path = path.with_file_name(format!(
-        "{}-before-invoke-tool-suite-{stamp}.db",
-        path.file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("invokeai")
-    ));
-    let mut target = Connection::open(&backup_path)
-        .map_err(|e| format!("Could not create the safety backup: {e}"))?;
-    let backup = Backup::new(db, &mut target)
-        .map_err(|e| format!("Could not start the safety backup: {e}"))?;
-    loop {
-        match backup
-            .step(64)
-            .map_err(|e| format!("Could not complete the safety backup: {e}"))?
-        {
-            StepResult::Done => break,
-            StepResult::More => {}
-            StepResult::Busy | StepResult::Locked => {
-                std::thread::sleep(std::time::Duration::from_millis(20))
-            }
-            _ => std::thread::sleep(std::time::Duration::from_millis(20)),
-        }
-    }
-    drop(backup);
-    super::prune_safety_backups(path, retention)?;
-    Ok(backup_path)
+    has_thumbnail: bool,
 }
 
 fn has_content(value: Option<&Value>) -> bool {
@@ -217,34 +191,13 @@ fn has_content(value: Option<&Value>) -> bool {
 }
 
 fn discover_models(
-    db: &Connection,
+    api: &super::invoke_api::InvokeApiClient,
     include_loras: bool,
     include_checkpoints: bool,
 ) -> Result<Vec<Model>, String> {
-    let exists: bool = db
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='models')",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("Could not inspect the model database: {e}"))?;
-    if !exists {
-        return Err("This database does not contain InvokeAI's models table.".into());
-    }
-    let mut statement = db
-        .prepare("SELECT id, config FROM models ORDER BY id")
-        .map_err(|e| format!("Could not read model records: {e}"))?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|e| e.to_string())?;
+    let records = api.model_records()?;
     let mut models = Vec::new();
-    for row in rows {
-        let (id, config_text) = row.map_err(|e| e.to_string())?;
-        let Ok(config) = serde_json::from_str::<Value>(&config_text) else {
-            continue;
-        };
+    for config in records {
         let model_type = config
             .get("type")
             .or_else(|| config.get("model_type"))
@@ -265,9 +218,8 @@ fn discover_models(
         }
         let key = config
             .get("key")
-            .and_then(Value::as_str)
-            .unwrap_or(&id)
-            .to_owned();
+            .and_then(Value::as_str);
+        let Some(key) = key.map(str::to_owned) else { continue; };
         let name = config
             .get("name")
             .and_then(Value::as_str)
@@ -279,14 +231,14 @@ fn discover_models(
         let path = PathBuf::from(stored_path);
         let triggers = config.get("trigger_phrases");
         let needs_triggers = !has_content(triggers);
-        let needs_thumbnail = !has_content(config.get("cover_image"));
+        let has_thumbnail = has_content(config.get("cover_image"));
         models.push(Model {
             key,
             name,
             kind: if is_lora { "LoRA" } else { "checkpoint" }.to_owned(),
             path,
             needs_triggers,
-            needs_thumbnail,
+            has_thumbnail,
         });
     }
     Ok(models)
@@ -428,18 +380,31 @@ fn extract_phrases(data: &Value) -> Vec<String> {
 }
 
 fn extract_preview(data: &Value) -> Option<String> {
-    data.get("images")?
-        .as_array()?
-        .iter()
-        .filter_map(|image| image.get("url").and_then(Value::as_str))
-        .find(|url| url.starts_with("https://"))
-        .map(str::to_owned)
+    let images = data.get("images")?.as_array()?;
+    images.iter().find_map(|image| {
+        let url = image.get("url")?.as_str()?;
+        let kind = image.get("type").and_then(Value::as_str).unwrap_or("");
+        (is_still_preview(url) && !kind.eq_ignore_ascii_case("video")).then(|| url.to_owned())
+    })
+}
+
+fn is_still_preview(url: &str) -> bool {
+    let Some(parsed) = reqwest::Url::parse(url).ok() else {
+        return false;
+    };
+    let path = parsed.path().to_ascii_lowercase();
+    parsed.scheme() == "https"
+        && ![".mp4", ".webm", ".mov", ".m4v"]
+            .iter()
+            .any(|ext| path.ends_with(ext))
 }
 
 fn fetch_preview(
     client: &reqwest::blocking::Client,
     url: &str,
     cancelled: &AtomicBool,
+    thumbnail_size: u32,
+    thumbnail_quality: u8,
 ) -> Result<String, String> {
     if cancelled.load(Ordering::Relaxed) {
         return Err(CANCELLED_REASON.into());
@@ -478,7 +443,7 @@ fn fetch_preview(
         .content_length()
         .is_some_and(|size| size > MAX_PREVIEW_BYTES)
     {
-        return Err("Preview image exceeds the 20 MB limit.".into());
+        return Err("Original preview image exceeds the 100 MB download limit.".into());
     }
     let mut bytes = Vec::new();
     let mut response = response.take(MAX_PREVIEW_BYTES + 1);
@@ -499,48 +464,36 @@ fn fetch_preview(
         return Err("Downloaded preview image is empty.".into());
     }
     if bytes.len() as u64 > MAX_PREVIEW_BYTES {
-        return Err("Preview image exceeds the 20 MB limit.".into());
+        return Err("Original preview image exceeds the 100 MB download limit.".into());
     }
     let image = image::load_from_memory(&bytes)
         .map_err(|e| format!("Could not decode preview image: {e}"))?;
-    let thumbnail = image.thumbnail(256, 256);
+    let thumbnail = if thumbnail_size == 0 {
+        image
+    } else {
+        image.thumbnail(thumbnail_size, thumbnail_size)
+    };
     let mut jpeg = Cursor::new(Vec::new());
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 80)
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, thumbnail_quality)
         .encode_image(&thumbnail)
         .map_err(|e| format!("Could not encode preview as JPEG: {e}"))?;
+    let jpeg_bytes = jpeg.into_inner();
     Ok(format!(
         "data:image/jpeg;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(jpeg.into_inner())
+        base64::engine::general_purpose::STANDARD.encode(jpeg_bytes)
     ))
 }
 
 fn save_config(
-    db: &Connection,
+    api: &super::invoke_api::InvokeApiClient,
     key: &str,
     phrases: Option<&[String]>,
-    cover: Option<&str>,
 ) -> Result<(), String> {
-    let stored: String = db
-        .query_row(
-            "SELECT config FROM models WHERE id=?1",
-            params![key],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("Could not reload model record before updating it: {e}"))?;
-    let mut updated: Value = serde_json::from_str(&stored)
-        .map_err(|e| format!("Could not parse model configuration: {e}"))?;
+    let mut changes = serde_json::Map::new();
     if let Some(phrases) = phrases {
-        updated["trigger_phrases"] = json!(phrases);
+        changes.insert("trigger_phrases".into(), json!(phrases));
     }
-    if let Some(cover) = cover {
-        updated["cover_image"] = json!(cover);
-    }
-    let serialized = serde_json::to_string(&updated).map_err(|e| e.to_string())?;
-    db.execute(
-        "UPDATE models SET config=?1 WHERE id=?2",
-        params![serialized, key],
-    )
-    .map_err(|e| format!("Could not update model record: {e}"))?;
+    api.update_model_record(key, &Value::Object(changes))?;
     Ok(())
 }
 
@@ -569,13 +522,15 @@ fn process_model(
     window: &tauri::Window,
     current: usize,
     total: usize,
-    db: &Connection,
+    api: &super::invoke_api::InvokeApiClient,
     client: &reqwest::blocking::Client,
     model: &Model,
     cache: &mut HashMap<String, CachedMatch>,
     api_key: &str,
     cancelled: &AtomicBool,
     stats: &mut Report,
+    thumbnail_size: u32,
+    thumbnail_quality: u8,
 ) -> Result<(), String> {
     if cancelled.load(Ordering::Relaxed) {
         return Err(CANCELLED_REASON.into());
@@ -583,15 +538,20 @@ fn process_model(
     if !model.needs_triggers {
         stats.already_had_triggers += 1;
     }
-    if !model.needs_thumbnail {
-        stats.already_had_thumbnails += 1;
-    }
-    if !model.needs_triggers && !model.needs_thumbnail {
-        return Ok(());
-    }
     if !model.path.is_file() {
         stats.skipped += 1;
         return Err("Model file is missing.".into());
+    }
+    let thumbnail_settings_match = cache.get(&model.key).is_some_and(|entry| {
+        entry.thumbnail_size == Some(thumbnail_size)
+            && entry.thumbnail_quality == Some(thumbnail_quality)
+    });
+    let needs_thumbnail = !model.has_thumbnail || !thumbnail_settings_match;
+    if !needs_thumbnail {
+        stats.already_had_thumbnails += 1;
+    }
+    if !model.needs_triggers && !needs_thumbnail {
+        return Ok(());
     }
     emit_model_progress(
         window,
@@ -602,8 +562,19 @@ fn process_model(
     );
     let current_fingerprint = fingerprint(&model.path)?;
     let saved_entry = cache.get(&model.key);
+    let saved_fingerprint_matches =
+        saved_entry.is_some_and(|entry| entry.fingerprint == current_fingerprint);
     let cached = saved_entry
         .filter(|entry| entry.fingerprint == current_fingerprint)
+        .filter(|entry| {
+            !needs_thumbnail
+                || match entry.preview_url.as_deref() {
+                    Some(url) => is_still_preview(url),
+                    None => {
+                        entry.preview_checked && entry.preview_version >= PREVIEW_CACHE_VERSION
+                    }
+                }
+        })
         .cloned();
     let (phrases, preview_url) = if let Some(entry) = cached {
         stats.cache_hits += 1;
@@ -618,10 +589,18 @@ fn process_model(
             stats.cached_not_found += 1;
             return Ok(());
         }
-        (entry.trigger_phrases, entry.preview_url)
+        (
+            entry.trigger_phrases,
+            entry.preview_url.filter(|url| is_still_preview(url)),
+        )
     } else {
         stats.lookup_attempts += 1;
-        let hashing_status = if saved_entry.is_some() {
+        let hashing_status = if saved_fingerprint_matches {
+            format!(
+                "Saved {} preview needs refreshing; hashing it again",
+                model.kind
+            )
+        } else if saved_entry.is_some() {
             format!(
                 "Saved {} lookup is for a different file version; hashing it again",
                 model.kind
@@ -655,6 +634,10 @@ fn process_model(
                     status: "not_found".into(),
                     trigger_phrases: Vec::new(),
                     preview_url: None,
+                    preview_checked: true,
+                    preview_version: PREVIEW_CACHE_VERSION,
+                    thumbnail_size: None,
+                    thumbnail_quality: None,
                 },
             );
             stats.not_found += 1;
@@ -669,6 +652,10 @@ fn process_model(
                 status: "matched".into(),
                 trigger_phrases: phrases.clone(),
                 preview_url: preview_url.clone(),
+                preview_checked: true,
+                preview_version: PREVIEW_CACHE_VERSION,
+                thumbnail_size: None,
+                thumbnail_quality: None,
             },
         );
         (phrases, preview_url)
@@ -678,10 +665,10 @@ fn process_model(
         stats.no_trigger_phrases += 1;
     }
     if add_phrases {
-        save_config(db, &model.key, Some(&phrases), None)?;
+        save_config(api, &model.key, Some(&phrases))?;
         stats.trigger_phrases_added += 1;
     }
-    let cover = if model.needs_thumbnail {
+    let cover = if needs_thumbnail {
         match preview_url {
             Some(url) => {
                 emit_model_progress(
@@ -691,7 +678,7 @@ fn process_model(
                     &model.name,
                     &format!("Downloading {} preview", model.kind),
                 );
-                match fetch_preview(client, &url, cancelled) {
+                match fetch_preview(client, &url, cancelled, thumbnail_size, thumbnail_quality) {
                     Ok(data_url) => Some(data_url),
                     Err(error) => {
                         stats.errors += 1;
@@ -704,19 +691,33 @@ fn process_model(
                 None
             }
         }
-    } else {
-        stats.already_had_thumbnails += 1;
-        None
-    };
-    if let Some(cover) = cover {
-        save_config(db, &model.key, None, Some(&cover))?;
-        stats.thumbnails_added += 1;
+    } else { None };
+    if let Some(data_url) = cover {
+        let (_, encoded) = data_url.split_once(',').ok_or("CivitAI thumbnail data was malformed.")?;
+        let jpeg = base64::engine::general_purpose::STANDARD.decode(encoded)
+            .map_err(|error| format!("Could not decode the prepared thumbnail: {error}"))?;
+        api.update_model_image(&model.key, jpeg)?;
+        if let Some(entry) = cache.get_mut(&model.key) {
+            entry.thumbnail_size = Some(thumbnail_size);
+            entry.thumbnail_quality = Some(thumbnail_quality);
+        }
+        if model.has_thumbnail {
+            stats.thumbnails_updated += 1;
+        } else {
+            stats.thumbnails_added += 1;
+        }
     }
     Ok(())
 }
 
-fn cache_path_for(database: &str) -> PathBuf {
-    Path::new(database).with_file_name("invoke-tool-suite-civitai-cache.json")
+fn cache_path_for(app: &tauri::AppHandle, server_url: &str) -> Result<PathBuf, String> {
+    let directory = app.path().app_config_dir()
+        .map_err(|error| format!("Could not locate the app settings folder: {error}"))?;
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Could not create the app settings folder: {error}"))?;
+    let normalized_url = server_url.trim().trim_end_matches('/');
+    let digest = ring::digest::digest(&SHA256, normalized_url.as_bytes());
+    Ok(directory.join(format!("invoke-tool-suite-civitai-{}.json", &hex::encode(digest)[..16])))
 }
 
 fn inspect_cache(path: &Path) -> CacheInfo {
@@ -727,6 +728,7 @@ fn inspect_cache(path: &Path) -> CacheInfo {
         entries: 0,
         matched: 0,
         not_found: 0,
+        thumbnail_settings: 0,
         read_error: None,
     };
     if !exists {
@@ -744,6 +746,12 @@ fn inspect_cache(path: &Path) -> CacheInfo {
             info.not_found = cache
                 .values()
                 .filter(|entry| entry.status == "not_found")
+                .count();
+            info.thumbnail_settings = cache
+                .values()
+                .filter(|entry| {
+                    entry.thumbnail_size.is_some() && entry.thumbnail_quality.is_some()
+                })
                 .count();
         }
         Err(error) => info.read_error = Some(error),
@@ -769,49 +777,50 @@ fn persist_cache(path: &Path, cache: &HashMap<String, CachedMatch>) -> Result<()
         .map_err(|error| format!("Could not replace the CivitAI cache: {error}"))
 }
 
-fn migrate_legacy_cache(database: &str) -> Result<PathBuf, String> {
-    let current_path = cache_path_for(database);
-    let legacy_path = Path::new(database).with_file_name("invoke-tools-civitai-cache.json");
-    if !legacy_path.is_file() {
+fn migrate_legacy_cache(
+    app: &tauri::AppHandle,
+    server_url: &str,
+    legacy_database: Option<&str>,
+) -> Result<PathBuf, String> {
+    let current_path = cache_path_for(app, server_url)?;
+    let Some(database) = legacy_database.filter(|path| Path::new(path).is_file()) else {
         return Ok(current_path);
+    };
+    let legacy_paths = [
+        Path::new(database).with_file_name("invoke-tool-suite-civitai-cache.json"),
+        Path::new(database).with_file_name("invoke-tools-civitai-cache.json"),
+    ];
+    let mut merged: HashMap<String, CachedMatch> = fs::read(&current_path)
+        .ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+    let mut changed = false;
+    let mut migrated_paths = Vec::new();
+    for legacy_path in legacy_paths {
+        if !legacy_path.is_file() || legacy_path == current_path { continue; }
+        let bytes = fs::read(&legacy_path)
+            .map_err(|error| format!("Could not read the old CivitAI cache: {error}"))?;
+        let legacy: HashMap<String, CachedMatch> = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("Could not migrate the old CivitAI cache: {error}"))?;
+        for (key, value) in legacy { merged.entry(key).or_insert(value); }
+        changed = true;
+        migrated_paths.push(legacy_path);
     }
-    let legacy_bytes = fs::read(&legacy_path)
-        .map_err(|error| format!("Could not read the old CivitAI cache: {error}"))?;
-    let mut legacy: HashMap<String, CachedMatch> = serde_json::from_slice(&legacy_bytes)
-        .map_err(|error| format!("Could not migrate the old CivitAI cache: {error}"))?;
-    if current_path.is_file() {
-        let current_bytes = fs::read(&current_path)
-            .map_err(|error| format!("Could not read the current CivitAI cache: {error}"))?;
-        let mut current: HashMap<String, CachedMatch> = serde_json::from_slice(&current_bytes)
-            .map_err(|error| format!("Could not read the current CivitAI cache: {error}"))?;
-        for (key, value) in legacy.drain() {
-            current.entry(key).or_insert(value);
-        }
-        persist_cache(&current_path, &current)?;
-    } else {
-        persist_cache(&current_path, &legacy)?;
+    if changed { persist_cache(&current_path, &merged)?; }
+    for legacy_path in migrated_paths {
+        fs::remove_file(&legacy_path)
+            .map_err(|error| format!("Could not remove the migrated CivitAI cache: {error}"))?;
     }
-    fs::remove_file(&legacy_path)
-        .map_err(|error| format!("Could not remove the old CivitAI cache: {error}"))?;
     Ok(current_path)
 }
 
 #[tauri::command]
-pub(super) fn get_civitai_cache_info(database: String) -> Result<CacheInfo, String> {
-    let path = Path::new(&database);
-    if !path.is_file() {
-        return Err("Choose an existing v7 database file first.".into());
-    }
-    Ok(inspect_cache(&migrate_legacy_cache(&database)?))
+pub(super) fn get_civitai_cache_info(app: tauri::AppHandle, server_url: String, legacy_database: Option<String>) -> Result<CacheInfo, String> {
+    let path = migrate_legacy_cache(&app, &server_url, legacy_database.as_deref())?;
+    Ok(inspect_cache(&path))
 }
 
 #[tauri::command]
-pub(super) fn clear_civitai_cache(database: String) -> Result<CacheInfo, String> {
-    let path = Path::new(&database);
-    if !path.is_file() {
-        return Err("Choose an existing v7 database file first.".into());
-    }
-    let cache_path = migrate_legacy_cache(&database)?;
+pub(super) fn clear_civitai_cache(app: tauri::AppHandle, server_url: String, legacy_database: Option<String>) -> Result<CacheInfo, String> {
+    let cache_path = migrate_legacy_cache(&app, &server_url, legacy_database.as_deref())?;
     match fs::remove_file(&cache_path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -823,19 +832,22 @@ pub(super) fn clear_civitai_cache(database: String) -> Result<CacheInfo, String>
 #[tauri::command]
 pub async fn enrich_civitai_models(
     window: tauri::Window,
-    backups: tauri::State<'_, super::SafetyBackups>,
     tasks: tauri::State<'_, CivitaiTasks>,
-    database: String,
+    legacy_database: Option<String>,
+    server_url: String,
     include_loras: bool,
     include_checkpoints: bool,
     refresh_cache: bool,
     task_id: String,
+    thumbnail_size: u32,
+    thumbnail_quality: u8,
 ) -> Result<Report, String> {
-    let backups = backups.0.clone();
     let task_registry = tasks.0.clone();
-    let retention = super::backup_retention(window.app_handle())?;
     if !include_loras && !include_checkpoints {
         return Err("Select LoRAs, checkpoints, or both.".into());
+    }
+    if !(40..=100).contains(&thumbnail_quality) {
+        return Err("Thumbnail quality must be between 40 and 100.".into());
     }
     let cancelled = Arc::new(AtomicBool::new(false));
     {
@@ -849,46 +861,19 @@ pub async fn enrich_civitai_models(
     }
     let worker_task_id = task_id.clone();
     let worker_cancelled = cancelled.clone();
+    let app_handle = window.app_handle().clone();
     super::set_taskbar_indeterminate(&window);
     let taskbar_window = window.clone();
     let join = tauri::async_runtime::spawn_blocking(move || {
-        let database_path = Path::new(&database);
-        if !database_path.is_file() {
-            return Err("Choose an existing v7 database file.".to_owned());
-        }
-        let db = Connection::open_with_flags(
-            database_path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|e| format!("Could not open the v7 model database: {e}"))?;
-        let models = discover_models(&db, include_loras, include_checkpoints)?;
-        let destination_key = database_path
-            .canonicalize()
-            .unwrap_or_else(|_| database_path.to_path_buf());
-        let existing = backups
-            .lock()
-            .map_err(|_| "Safety backup registry is unavailable.".to_owned())?
-            .get(&destination_key)
-            .filter(|path| path.is_file())
-            .cloned();
-        let (backup_path, backup_created) = if let Some(path) = existing {
-            super::prune_safety_backups(database_path, retention)?;
-            (path, false)
-        } else {
-            let path = backup_database(&db, database_path, retention)?;
-            backups
-                .lock()
-                .map_err(|_| "Safety backup registry is unavailable.".to_owned())?
-                .insert(destination_key, path.clone());
-            (path, true)
-        };
+        let api = super::make_invoke_api(&server_url, None)?;
+        let models = discover_models(&api, include_loras, include_checkpoints)?;
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .map_err(|e| format!("Could not initialize secure CivitAI connection: {e}"))?;
         let api_key = load_civitai_api_key()?.unwrap_or_default();
-        let cache_path = migrate_legacy_cache(&database)?;
+        let cache_path = migrate_legacy_cache(&app_handle, &server_url, legacy_database.as_deref())?;
         if refresh_cache {
             match fs::remove_file(&cache_path) {
                 Ok(()) => {}
@@ -913,12 +898,11 @@ pub async fn enrich_civitai_models(
             no_preview_image: 0,
             trigger_phrases_added: 0,
             thumbnails_added: 0,
+            thumbnails_updated: 0,
             already_had_triggers: 0,
             already_had_thumbnails: 0,
             skipped: 0,
             errors: 0,
-            backup_path: backup_path.to_string_lossy().into_owned(),
-            backup_created,
             issues: Vec::new(),
         };
         let mut cache_dirty = false;
@@ -937,31 +921,39 @@ pub async fn enrich_civitai_models(
                 );
                 break;
             }
-            let _ = window.emit(
-                "civitai-progress",
-                Progress {
-                    current: index + 1,
-                    total,
-                    percent: super::task_progress_percent(index + 1, total),
-                    model_name: model.name.clone(),
-                    status: "Looking up model".into(),
-                },
-            );
-            super::set_taskbar_percent(&window, super::task_progress_percent(index + 1, total));
+            if index % 25 == 0 || index + 1 == total {
+                let percent = super::task_progress_percent(index + 1, total);
+                let _ = window.emit(
+                    "civitai-progress",
+                    Progress {
+                        current: index + 1,
+                        total,
+                        percent,
+                        model_name: model.name.clone(),
+                        status: "Checking saved model details".into(),
+                    },
+                );
+                super::set_taskbar_percent(&window, percent);
+            }
             let attempts_before = report.lookup_attempts;
+            let thumbnail_changes_before = report.thumbnails_added + report.thumbnails_updated;
             let result = process_model(
                 &window,
                 index + 1,
                 total,
-                &db,
+                &api,
                 &client,
                 model,
                 &mut cache,
                 &api_key,
                 &worker_cancelled,
                 &mut report,
+                thumbnail_size,
+                thumbnail_quality,
             );
-            if report.lookup_attempts > attempts_before {
+            if report.lookup_attempts > attempts_before
+                || report.thumbnails_added + report.thumbnails_updated > thumbnail_changes_before
+            {
                 cache_dirty = true;
             }
             // Save each attempted lookup before a cancellation can leave the loop.

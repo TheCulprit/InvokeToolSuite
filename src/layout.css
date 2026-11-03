@@ -66,6 +66,16 @@ h1{font-size:clamp(26px,2vw,36px);line-height:1.15;letter-spacing:-.7px}
 .civitai-options{display:flex;align-items:center;gap:20px;margin-top:20px}
 .civitai-options label{display:flex;align-items:center;gap:8px;color:#d4dbcf;font-size:12px;cursor:pointer}
 .civitai-options input{width:15px;height:15px;accent-color:#c8ef83}
+.civitai-thumbnail-options{display:grid;grid-template-columns:1fr 1fr;gap:10px 22px;margin-top:18px;padding:14px 16px;border:1px solid #353b33;border-radius:8px;background:#151815}
+.civitai-thumbnail-options>strong{grid-column:1/-1;color:#e0e6d9;font-size:12px}
+.civitai-thumbnail-options label{display:grid;grid-template-columns:1fr auto;align-items:center;gap:7px 12px;color:#aeb5aa;font-size:11px}
+.civitai-thumbnail-options label b{color:#e0e6d9;font-size:11px;font-weight:600}
+.civitai-thumbnail-options input[type=range]{grid-column:1/-1;width:100%;margin:0;accent-color:#c8ef83}
+.civitai-thumbnail-options .thumbnail-size-field select{grid-column:1/-1;width:100%;height:34px;padding:0 9px;border:1px solid #3c413b;border-radius:6px;background:#111311;color:#e0e6da;font:12px 'Segoe UI',sans-serif}
+.civitai-thumbnail-options .thumbnail-size-field select:disabled{opacity:.55}
+.civitai-thumbnail-options .original-size-toggle{grid-column:1/-1;display:flex;justify-content:flex-start;gap:9px}
+.civitai-thumbnail-options .original-size-toggle input{width:15px;height:15px;margin:0;accent-color:#c8ef83}
+.civitai-thumbnail-options>small{grid-column:1/-1;color:#7e867a;font-size:10px}
 .civitai-cache{margin:0 28px 16px;padding:14px 16px;border:1px solid #353b33;border-radius:8px;background:#151815}
 .civitai-cache-heading{display:flex;align-items:center;justify-content:space-between;gap:15px}
 .civitai-cache-heading>div{display:flex;flex-direction:column;gap:4px;min-width:0}
@@ -202,4 +212,50 @@ h1{font-size:clamp(26px,2vw,36px);line-height:1.15;letter-spacing:-.7px}
  .field-stack{padding-top:18px;padding-bottom:18px}
  .path-input{height:43px}
  .outputs-label,.path-input + .field-label{margin-top:16px}
+}
+
+/* Compact, deliberate layout for the shared Invoke connection controls. */
+.content>.api-settings-panel{
+ flex:none;
+ display:grid;
+ grid-template-columns:minmax(0,1fr) minmax(0,1fr);
+ align-items:center;
+ gap:28px;
+ margin-top:12px;
+ padding:20px 24px;
+}
+.api-connection-block,.api-login-block{min-width:0}
+.api-settings-panel .field-label{margin:0 0 8px;font-size:11px}
+.api-connection-row{display:flex;align-items:center;gap:14px;min-width:0}
+.api-connection-row input,.api-login-row input{
+ width:100%;height:40px;min-width:0;padding:0 11px;
+ border:1px solid #3c413b;border-radius:7px;background:#111411;
+ color:#e0e4da;font:13px 'Segoe UI',sans-serif;outline:none;
+}
+.api-connection-row input:focus,.api-login-row input:focus{border-color:#83a956}
+.api-connection-row input{flex:1}
+.api-connected,.api-disconnected{flex:none;font-size:12px;white-space:nowrap}
+.api-connected{color:#b8dc83}
+.api-disconnected{color:#c4a874}
+.api-settings-panel .hint{font-size:11px;margin-top:8px}
+.api-login-block{padding-left:28px;border-left:1px solid #30352e}
+.api-login-block>strong{display:block;margin-bottom:9px;color:#e3e8dd;font-size:13px;font-weight:650}
+.api-login-block>strong span{color:#858d81;font-size:11px;font-weight:400}
+.api-login-row{display:grid;grid-template-columns:minmax(110px,1fr) minmax(110px,1fr) auto auto;gap:8px;align-items:center}
+.api-login-row .secondary{height:40px;white-space:nowrap}
+.api-login-block .hint{margin-bottom:0}
+.content>.home-panel{gap:18px;padding-top:16px}
+.home-tools{flex:none;grid-auto-rows:auto}
+.home-tool-card{min-height:142px;padding:17px 19px;gap:8px}
+.home-tool-icon{width:36px;height:36px;border-radius:9px}
+.home-tool-card>strong{font-size:15px}
+.home-tool-card>p{font-size:11px}
+.home-tool-link{margin-top:3px}
+@media(max-width:1150px){
+ .content>.api-settings-panel{grid-template-columns:minmax(0,1fr);gap:16px;padding:18px 20px}
+ .api-login-block{padding:16px 0 0;border-left:0;border-top:1px solid #30352e}
+}
+@media(max-width:720px){
+ .api-login-row{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+ .api-connection-row{align-items:flex-start;flex-direction:column}
 }
