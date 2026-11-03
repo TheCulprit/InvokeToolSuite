@@ -9,7 +9,7 @@ use ring::digest::{Context, SHA256};
 use std::{
     collections::HashMap,
     fs::{self, File},
-    io::{Read, Write},
+    io::{Cursor, Read, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -501,9 +501,16 @@ fn fetch_preview(
     if bytes.len() as u64 > MAX_PREVIEW_BYTES {
         return Err("Preview image exceeds the 20 MB limit.".into());
     }
+    let image = image::load_from_memory(&bytes)
+        .map_err(|e| format!("Could not decode preview image: {e}"))?;
+    let thumbnail = image.thumbnail(256, 256);
+    let mut jpeg = Cursor::new(Vec::new());
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 80)
+        .encode_image(&thumbnail)
+        .map_err(|e| format!("Could not encode preview as JPEG: {e}"))?;
     Ok(format!(
-        "data:{mime};base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(bytes)
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(jpeg.into_inner())
     ))
 }
 
