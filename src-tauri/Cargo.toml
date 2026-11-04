@@ -1,6 +1,6 @@
 [package]
 name = "invoke-tool-suite"
-version = "1.0.1"
+version = "1.0.2"
 description = "Invoke Tool Suite desktop app"
 authors = ["you"]
 edition = "2021"
