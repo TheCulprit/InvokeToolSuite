@@ -9,7 +9,7 @@ use reqwest::blocking::{multipart, Client, Response};
 use reqwest::{Method, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
-use std::{fs::File, path::Path, thread, time::Duration};
+use std::{fs::File, io::{Read, Seek}, path::Path, thread, time::Duration};
 
 const MAX_ERROR_BODY: usize = 2_000;
 const MAX_GET_ATTEMPTS: usize = 3;
@@ -156,12 +156,23 @@ impl InvokeApiClient {
         project_id: Option<&str>,
         metadata: Option<&str>,
     ) -> Result<Value, String> {
-        let file = File::open(file_path).map_err(|error| format!("Could not open source image: {error}"))?;
+        let mut file = File::open(file_path).map_err(|error| format!("Could not open source image: {error}"))?;
         let length = file.metadata().map_err(|error| format!("Could not inspect source image: {error}"))?.len();
         let filename = file_path.file_name().and_then(|name| name.to_str()).ok_or("The source image has an invalid filename.")?;
+        let mut signature = [0u8; 64];
+        let signature_length = file.read(&mut signature).map_err(|error| format!("Could not identify source image: {error}"))?;
+        file.rewind().map_err(|error| format!("Could not prepare source image: {error}"))?;
+        let mime = match image::guess_format(&signature[..signature_length])
+            .map_err(|error| format!("Could not identify source image format: {error}"))?
+        {
+            image::ImageFormat::Png => "image/png",
+            image::ImageFormat::Jpeg => "image/jpeg",
+            image::ImageFormat::WebP => "image/webp",
+            _ => return Err("Invoke image transfer supports PNG, JPEG, and WebP files.".into()),
+        };
         let part = multipart::Part::reader_with_length(file, length)
             .file_name(filename.to_owned())
-            .mime_str("application/octet-stream")
+            .mime_str(mime)
             .map_err(|error| format!("Could not prepare the image upload: {error}"))?;
         let mut form = multipart::Form::new().part("file", part);
         if let Some(metadata) = metadata {
