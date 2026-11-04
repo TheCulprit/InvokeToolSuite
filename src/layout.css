@@ -259,3 +259,4 @@ h1{font-size:clamp(26px,2vw,36px);line-height:1.15;letter-spacing:-.7px}
  .api-login-row{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
  .api-connection-row{align-items:flex-start;flex-direction:column}
 }
+.destination-select-heading{display:flex;justify-content:space-between;align-items:center;gap:10px}.destination-select-heading>.field-label{margin-bottom:10px}.destination-actions{display:flex;align-items:center;gap:7px;margin-bottom:10px}.destination-actions>select{width:auto;height:29px;padding:0 8px;font-size:10px}.refresh-lists{height:29px;padding:0 8px;gap:6px;font-size:10px;white-space:nowrap}

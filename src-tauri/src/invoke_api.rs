@@ -19,6 +19,8 @@ pub(crate) struct ProjectSummary {
     pub project_id: String,
     pub board_id: String,
     pub name: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]

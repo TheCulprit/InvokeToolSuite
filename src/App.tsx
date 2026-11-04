@@ -8,7 +8,7 @@ import { CivitaiPanel } from './CivitaiPanel'
 type Stage = 'source' | 'browse' | 'destination' | 'review'
 type Board = { board_id: string; board_name: string; image_count: number }
 type SourceImage = { image_name: string; image_subfolder: string; created_at: string; width: number; height: number; preview?: string }
-type Project = { project_id: string; name: string; board_id: string }
+type Project = { project_id: string; name: string; board_id: string; created_at?: string | null }
 type TargetBoard = { board_id: string; board_name: string; project_id?: string | null; is_inbox?: boolean }
 type Report = { imported: number; skipped: number; issues: {image_name:string;reason:string}[]; dates_note: string }
 type Progress = { phase: string; current: number; total: number; imported: number; skipped: number; image_name: string }
@@ -60,6 +60,8 @@ export default function App() {
   const activePreview = useRef<string | null>(null)
   const previewListeners = useRef<(() => void)[]>([])
   const [projects, setProjects] = useState<Project[]>([])
+  const [projectSort, setProjectSort] = useState<'name' | 'oldest' | 'newest'>('name')
+  const [destinationRefreshing, setDestinationRefreshing] = useState(false)
   const [targetProject, setTargetProject] = useState('')
   const [targetBoards, setTargetBoards] = useState<TargetBoard[]>([])
   const [targetBoard, setTargetBoard] = useState('')
@@ -114,6 +116,15 @@ export default function App() {
     return () => window.removeEventListener('keydown', navigate)
   }, [lightbox, images])
   const filteredBoards = useMemo(() => boards.filter(board => board.board_name.toLowerCase().includes(filter.toLowerCase())), [boards, filter])
+  const sortedProjects = useMemo(() => [...projects].sort((a, b) => {
+    if (projectSort === 'name') return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+    const dateA = a.created_at ? Date.parse(a.created_at) : Number.NaN
+    const dateB = b.created_at ? Date.parse(b.created_at) : Number.NaN
+    if (!Number.isFinite(dateA) && !Number.isFinite(dateB)) return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+    if (!Number.isFinite(dateA)) return 1
+    if (!Number.isFinite(dateB)) return -1
+    return projectSort === 'oldest' ? dateA - dateB : dateB - dateA
+  }), [projects, projectSort])
   const selectedSource = boards.find(board => board.board_id === selectedBoard)
   const selectedProject = projects.find(project => project.project_id === targetProject)
   const selectedTarget = targetBoards.find(board => board.board_id === targetBoard)
@@ -194,6 +205,24 @@ export default function App() {
     try { setTargetBoards(await invoke<TargetBoard[]>('api_list_destination_boards', { serverUrl, token: null, projectId: id })) }
     catch (error) { setMessage(String(error)) }
   }
+  const refreshDestinationLists = async () => {
+    if (!apiConnected || destinationRefreshing) return
+    setDestinationRefreshing(true); setMessage('')
+    try {
+      const updatedProjects = await invoke<Project[]>('api_list_destination_projects', { serverUrl, token: null })
+      setProjects(updatedProjects)
+      if (targetProject && targetProject !== 'uncategorized') {
+        if (!updatedProjects.some(project => project.project_id === targetProject)) {
+          setTargetProject(''); setTargetBoard(''); setTargetBoards([])
+        } else {
+          const updatedBoards = await invoke<TargetBoard[]>('api_list_destination_boards', { serverUrl, token: null, projectId: targetProject })
+          setTargetBoards(updatedBoards)
+          if (targetBoard && !updatedBoards.some(board => board.board_id === targetBoard)) setTargetBoard('')
+        }
+      }
+    } catch (error) { setMessage(String(error)) }
+    finally { setDestinationRefreshing(false) }
+  }
   const loginInvoke = async () => {
     try {
       await invoke('login_invoke_api', { serverUrl, email: apiEmail, password: apiPassword })
@@ -258,7 +287,7 @@ export default function App() {
             </div>
           </div>
           <div className="panel-footer"><button className="secondary" disabled={busy} onClick={()=>{cancelPreview();setStage('source')}}><ArrowLeft size={14}/> Back</button><button className="primary" disabled={!selectedBoard || images.length === 0 || busy} onClick={()=>{cancelPreview();setStage('destination')}}>Choose destination <ArrowRight size={16}/></button></div>
-        </div>}        {stage==='destination' && <div className="panel"><PanelTitle icon={<FolderTree size={19}/>} title="Choose the v7 destination" subtitle="Select the project and board on the connected Invoke server."/><div className="field-stack"><div className="source-reminder"><span>SOURCE BOARD</span><strong>{selectedSource?.board_name ?? 'No board selected'}</strong><small>{selectedSource?.image_count ?? 0} images in this board</small></div>{!apiConnected&&<div className="inline-message">Connect to the Invoke API on the Home tab first.</div>}<div className="select-grid"><div><label className="field-label">PROJECT</label><select value={targetProject} onChange={e=>selectProject(e.target.value)} disabled={!apiConnected}><option value="">Select a project…</option>{projects.map(project=><option key={project.project_id} value={project.project_id}>{project.name}</option>)}<option value="uncategorized">Uncategorized</option></select></div><div><label className="field-label">BOARD</label><select value={targetBoard} onChange={e=>setTargetBoard(e.target.value)} disabled={!targetProject||targetProject==='uncategorized'}><option value="">Select a board…</option>{targetBoards.map(board=><option key={board.board_id} value={board.board_id}>{board.is_inbox?'Inbox':board.board_name}</option>)}</select></div></div></div><div className="panel-footer"><button className="secondary" onClick={()=>setStage('browse')}><ArrowLeft size={14}/> Back</button><button className="primary" disabled={!targetReady} onClick={()=>setStage('review')}>Review transfer <ArrowRight size={16}/></button></div></div>}
+        </div>}        {stage==='destination' && <div className="panel"><PanelTitle icon={<FolderTree size={19}/>} title="Choose the v7 destination" subtitle="Select the project and board on the connected Invoke server."/><div className="field-stack"><div className="source-reminder"><span>SOURCE BOARD</span><strong>{selectedSource?.board_name ?? 'No board selected'}</strong><small>{selectedSource?.image_count ?? 0} images in this board</small></div>{!apiConnected&&<div className="inline-message">Connect to the Invoke API on the Home tab first.</div>}<div className="select-grid"><div><div className="destination-select-heading"><label className="field-label">PROJECT</label><div className="destination-actions"><select aria-label="Sort projects" value={projectSort} onChange={e=>setProjectSort(e.target.value as 'name'|'oldest'|'newest')}><option value="name">Name A–Z</option><option value="oldest">Oldest first</option><option value="newest">Newest first</option></select><button className="secondary refresh-lists" type="button" disabled={!apiConnected||destinationRefreshing} onClick={()=>void refreshDestinationLists()} title="Refresh project and board lists"><RefreshCw size={14} className={destinationRefreshing?'spin':''}/><span>{destinationRefreshing?'Refreshing…':'Refresh lists'}</span></button></div></div><select value={targetProject} onChange={e=>selectProject(e.target.value)} disabled={!apiConnected||destinationRefreshing}><option value="">Select a project…</option>{sortedProjects.map(project=><option key={project.project_id} value={project.project_id}>{project.name}</option>)}<option value="uncategorized">Uncategorized</option></select></div><div><label className="field-label">BOARD</label><select value={targetBoard} onChange={e=>setTargetBoard(e.target.value)} disabled={!targetProject||targetProject==='uncategorized'||destinationRefreshing}><option value="">Select a board…</option>{targetBoards.map(board=><option key={board.board_id} value={board.board_id}>{board.is_inbox?'Inbox':board.board_name}</option>)}</select></div></div></div><div className="panel-footer"><button className="secondary" onClick={()=>setStage('browse')}><ArrowLeft size={14}/> Back</button><button className="primary" disabled={!targetReady} onClick={()=>setStage('review')}>Review transfer <ArrowRight size={16}/></button></div></div>}
         {stage==='review' && <div className="panel"><PanelTitle icon={<Check size={19}/>} title={report?'Transfer complete':'Review your transfer'} subtitle="Confirm the destination before uploading through the Invoke API."/><div className="review-summary"><div><span>FROM</span><strong>{selectedSource?.board_name}</strong><small>{selectedSource?.image_count ?? 0} images from this board</small></div><ArrowRight size={18}/><div><span>TO</span><strong>{targetProject==='uncategorized'?'Uncategorized':selectedProject?.name}</strong><small>{targetProject==='uncategorized'?'No board':selectedTarget?.board_name}</small></div></div>{report?<div className="report"><div className="report-stats"><strong>{report.imported}</strong><span>uploaded</span><strong>{report.skipped}</strong><span>skipped</span></div><p className="backup-note">{report.dates_note}</p>{report.issues.length>0&&<div className="issue-list"><h3>Images needing attention</h3>{report.issues.map((issue,i)=><div key={`${issue.image_name}-${i}`}><b>{issue.image_name}</b><span>{issue.reason}</span></div>)}</div>}</div>:null}{message&&<div className="inline-message">{message}</div>}{busy&&<div className="transfer-status"><div className="status-label">{progress?.phase==='upload'?`Uploading image ${progress.current} of ${progress.total}`:'Preparing transfer…'}{progress?.phase==='upload'&&progress.total>0&&<span>{Math.round(progress.current/progress.total*100)}%</span>}{progress?.phase==='upload'&&progress.image_name&&<span>{progress.image_name}</span>}</div><div className="progress-track"><div className={`progress-fill ${progress?.total?'determinate':''}`} style={{width:`${progress&&progress.total?progress.current/progress.total*100:2}%`}}/></div><small>{`${progress?.imported??0} uploaded · ${progress?.skipped??0} skipped`}</small></div>}<div className="panel-footer"><button className="secondary" disabled={busy} onClick={()=>setStage('destination')}><ArrowLeft size={14}/> Back</button><button className="primary" disabled={!report&&busy} onClick={report?()=>{setReport(null);setProgress(null);setMessage('');setStage('browse')}:startTransfer}>{busy?'Transferring…':report?'Done':'Start transfer'} {!busy&&!report&&<Upload size={15}/>}</button></div></div>}
         </> : <CivitaiPanel legacyDatabase={legacyCacheDatabase} serverUrl={serverUrl} onBusyChange={setCivitaiBusy}/>}
       </section>
